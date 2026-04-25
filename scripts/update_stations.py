@@ -3,7 +3,7 @@ import aiohttp
 import aiofiles
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 # 兼容包路径，自动把项目根目录加入PYTHONPATH
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -27,7 +27,7 @@ async def update_stations():
     print("🚀 12306车站信息更新工具")
     print("=" * 50)
     print(f"🌐 数据源: {STATION_JS_URL}")
-    print(f"⏰ 更新时间: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
+    print(f"⏰ 更新时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} (UTC)")
     print(f"👤 操作用户: {os.getenv('USERNAME') or os.getenv('USER') or 'unknown'}")
     print("=" * 50)
     try:
