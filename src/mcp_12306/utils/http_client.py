@@ -134,8 +134,10 @@ class RailwayHTTPClient:
         """获取指定 API 的完整 URL（自动附加动态后缀）。"""
         if key == "query_left_ticket":
             return _BASE_URLS["query_left_ticket"] + self._query_suffix
+        # query_transfer 使用固定后缀，不跟随 leftTicket 的动态后缀
+        # 因为 lcquery 与 leftTicket 可能不同步轮换
         if key == "query_transfer":
-            return _BASE_URLS["query_transfer"] + self._query_suffix
+            return _BASE_URLS["query_transfer"] + _DEFAULT_QUERY_SUFFIX
         return _BASE_URLS[key]
 
     async def request(
