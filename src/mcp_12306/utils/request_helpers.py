@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -119,8 +120,7 @@ async def make_paginated_12306_request(
                 if not isinstance(data, dict):
                     logger.warning("12306返回的data字段非预期格式: %s, 内容: %s", type(data), str(data)[:200])
                     return all_data if all_data else []
-                logger.info("12306中转查询响应 data keys: %s, middleList 长度: %d",
-                           list(data.keys()), len(data.get("middleList", [])))
+                logger.info("12306中转查询完整响应: %s", json.dumps(json_data, ensure_ascii=False)[:500])
                 items = data.get("middleList", [])
                 if not items:
                     logger.info("12306中转查询返回空数据, data keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
