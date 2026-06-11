@@ -1251,9 +1251,6 @@ async def query_ticket_price_validated(args: dict) -> list:
 
         # 解析票价信息
         if json_data and "data" in json_data:
-
-        # 解析票价信息
-        if json_data and "data" in json_data:
             result_data = []
             price_map = {
                 "wz_price": "无座",
