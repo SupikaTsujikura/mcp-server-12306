@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import httpx
 from datetime import datetime, date
 from typing import Dict, List, Any
 import uuid
@@ -16,6 +15,8 @@ import uvicorn
 from .services.station_service import StationService
 from .utils.config import get_settings
 from .utils.date_utils import validate_date, validate_date_not_past
+from .utils.http_client import RailwayHTTPClient
+from .utils.request_helpers import make_12306_request, make_paginated_12306_request
 from . import __version__
 
 settings = get_settings()
@@ -674,48 +675,23 @@ async def query_tickets_validated(args: dict) -> list:
             response_data = {"success": False, "error": "车站名称无效", "suggestions": suggestions, "hint": "可尝试拼音、简拼、三字码或用 search_stations 工具辅助查询"}
             return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
         
-        import httpx
-        url_init = HTTP_URLS["init"]
-        url_u = HTTP_URLS["query_left_ticket"]
-        headers = HTTP_HEADERS.copy()
-        max_retries = 3
-        last_exception = None
-        tickets_data = []
-
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
-                    await client.get(url_init, headers=headers)
-                    params = {
-                        "leftTicketDTO.train_date": train_date,
-                        "leftTicketDTO.from_station": from_code,
-                        "leftTicketDTO.to_station": to_code,
-                        "purpose_codes": "ADULT"
-                    }
-                    resp = await client.get(url_u, headers=headers, params=params)
-                    logger.info(f"12306 queryG status: {resp.status_code}, url: {resp.url}")
-                    if resp.status_code != 200:
-                        logger.error(f"12306接口返回异常: {resp.status_code}, body: {resp.text}")
-                        response_data = {"success": False, "error": "12306接口返回异常", "status_code": resp.status_code, "detail": resp.text[:200]}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                    try:
-                        data = resp.json().get("data", {})
-                        tickets_data = data.get("result", [])
-                        break  # Success
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {repr(e)}，原始内容: {resp.text}")
-                        response_data = {"success": False, "error": "12306响应解析失败", "detail": f"{type(e).__name__}: {str(e)}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"查询车票网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"查询车票网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        client = RailwayHTTPClient.get_instance()
+        json_data = await make_12306_request(
+            client,
+            "query_left_ticket",
+            params={
+                "leftTicketDTO.train_date": train_date,
+                "leftTicketDTO.from_station": from_code,
+                "leftTicketDTO.to_station": to_code,
+                "purpose_codes": "ADULT"
+            },
+            station_info={
+                "from_station": from_station,
+                "to_station": to_station,
+                "train_date": train_date,
+            },
+        )
+        tickets_data = json_data.get("data", {}).get("result", [])
         tickets = []
         for ticket_str in tickets_data:
             ticket = parse_ticket_string(ticket_str, {
@@ -784,6 +760,10 @@ async def query_tickets_validated(args: dict) -> list:
                 "message": "未找到该线路的余票"
             }
             return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+    except ValueError as e:
+        logger.error(f"查询车票业务错误: {e}")
+        response_data = {"success": False, "error": str(e)}
+        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     except Exception as e:
         import traceback
         error_detail = f"{type(e).__name__}: {str(e)}"
@@ -821,27 +801,30 @@ async def get_train_no_by_train_code_validated(args: dict) -> list:
         response_data = {"success": False, "error": f"到达站无效或无法识别：{to_station}"}
         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     to_station = to_code
-    
-    # HTTP 请求 - 复用全局 headers 定义
-    url_init = HTTP_URLS["init"]
-    url_u = HTTP_URLS["query_left_ticket"]
-    headers = HTTP_HEADERS.copy()
-    
-    async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
-        await client.get(url_init, headers=headers)
-        params = {
-            "leftTicketDTO.train_date": train_date,
-            "leftTicketDTO.from_station": from_station,
-            "leftTicketDTO.to_station": to_station,
-            "purpose_codes": "ADULT"
-        }
-        resp = await client.get(url_u, headers=headers, params=params)
-        try:
-            data = resp.json().get("data", {})
-            tickets_data = data.get("result", [])
-        except Exception:
-            response_data = {"success": False, "error": "12306反爬拦截或数据异常，请稍后重试"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+
+    try:
+        # HTTP 请求 - 使用 RailwayHTTPClient
+        client = RailwayHTTPClient.get_instance()
+        json_data = await make_12306_request(
+            client,
+            "query_left_ticket",
+            params={
+                "leftTicketDTO.train_date": train_date,
+                "leftTicketDTO.from_station": from_station,
+                "leftTicketDTO.to_station": to_station,
+                "purpose_codes": "ADULT"
+            },
+            station_info={
+                "from_station": from_station,
+                "to_station": to_station,
+                "train_date": train_date,
+            },
+        )
+        data = json_data.get("data", {})
+        tickets_data = data.get("result", [])
+    except ValueError as e:
+        response_data = {"success": False, "error": str(e)}
+        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     
     if not tickets_data:
         response_data = {"success": False, "error": f"未找到该线路的余票数据（{from_station}->{to_station} {train_date}）"}
@@ -984,62 +967,19 @@ async def get_train_route_stations_validated(args: dict) -> list:
             actual_train_no = train_no
             logger.info(f"使用列车编号: {actual_train_no}")
         
-        # 调用12306经停站接口 - 使用正确的API端点
-        url = HTTP_URLS["query_route_stations"]
-        params = {
-            "train_no": actual_train_no,  # 使用转换后的列车编号
-            "from_station_telecode": from_station,
-            "to_station_telecode": to_station,
-            "depart_date": train_date
-        }
-        
-        # 使用与参考实现相同的请求方式
-        headers = HTTP_HEADERS.copy()
-        
-        max_retries = 3
-        last_exception = None
-        json_data = None
+        # 调用12306经停站接口 - 使用 RailwayHTTPClient
+        client = RailwayHTTPClient.get_instance()
+        json_data = await make_12306_request(
+            client,
+            "query_route_stations",
+            params={
+                "train_no": actual_train_no,
+                "from_station_telecode": from_station,
+                "to_station_telecode": to_station,
+                "depart_date": train_date
+            },
+        )
 
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
-                    # 先访问init获取cookie
-                    init_resp = await client.get("https://kyfw.12306.cn/otn/leftTicket/init", headers=headers)
-                    logger.info(f"12306 init status: {init_resp.status_code}")
-                    
-                    resp = await client.get(url, headers=headers, params=params)
-                    logger.info(f"12306 route query status: {resp.status_code}, url: {resp.url}")
-                    
-                    # 检查HTTP状态码
-                    if resp.status_code != 200:
-                        logger.error(f"12306接口返回异常状态码: {resp.status_code}, body: {resp.text}")
-                        response_data = {"success": False, "error": f"12306接口返回异常: {resp.status_code}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                    
-                    # 检查是否被重定向到错误页面
-                    if "error.html" in str(resp.url) or "ntce" in str(resp.url):
-                        response_data = {"success": False, "error": "12306反爬虫拦截，请稍后重试或更换网络环境"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                    
-                    try:
-                        json_data = resp.json()
-                        logger.info(f"12306 response keys: {list(json_data.keys()) if json_data else 'None'}")
-                        break # Success
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {str(e)}, body: {resp.text}")
-                        response_data = {"success": False, "error": f"12306响应解析失败: {str(e)}"}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"查询经停站网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"查询经停站网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-        
         if not json_data:
             response_data = {"success": False, "error": "12306接口返回空数据"}
             return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
@@ -1083,7 +1023,11 @@ async def get_train_route_stations_validated(args: dict) -> list:
             "stations": stations_list
         }
         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-        
+
+    except ValueError as e:
+        logger.error(f"查询经停站业务错误: {e}")
+        response_data = {"success": False, "error": str(e)}
+        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     except Exception as e:
         logger.error(f"查询经停站失败: {repr(e)}")
         response_data = {"success": False, "error": "查询经停站失败", "detail": str(e)}
@@ -1114,13 +1058,7 @@ async def query_transfer_validated(args: dict) -> list:
             response_data = {"success": False, "error": error_msg}
             return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
         
-        # 自动转三字码 - 使用参考代码的实现
-        async def ensure_telecode(val):
-            if val.isalpha() and val.isupper() and len(val) == 3:
-                return val
-            code = await station_service.get_station_code(val)
-            return code
-        
+        # 自动转三字码 - 使用全局 ensure_telecode
         from_code = await ensure_telecode(from_station)
         to_code = await ensure_telecode(to_station)
         if not from_code:
@@ -1139,85 +1077,27 @@ async def query_transfer_validated(args: dict) -> list:
                 logger.warning(f"无法识别中转站: {middle_station}")
                 middle_station_code = middle_station 
         
-        # 使用中转查询专用接口
-        url_init = HTTP_URLS["init"]
-        url = HTTP_URLS["query_transfer"]
-        headers = HTTP_HEADERS.copy()
-        
-        all_transfer_list = []
-        max_retries = 3
-        last_exception = None
-
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
-                    # 先访问init获取cookie
-                    await client.get(url_init, headers=headers)
-                    
-                    # 分页查询所有中转方案
-                    page_size = 10
-                    result_index = 0
-                    page_num = 1
-                    
-                    while True:
-                        params = {
-                            "train_date": train_date,
-                            "from_station_telecode": from_code,
-                            "to_station_telecode": to_code,
-                            "middle_station": middle_station_code,
-                            "result_index": str(result_index),
-                            "can_query": "Y",
-                            "isShowWZ": isShowWZ,
-                            "purpose_codes": purpose_codes,
-                            "channel": "E"
-                        }
-                        
-                        resp = await client.get(url, headers=headers, params=params)
-                        
-                        # 检查反爬虫
-                        if resp.status_code == 302 or "error.html" in str(resp.headers.get("location", "")):
-                            if page_num == 1:
-                                response_data = {"success": False, "error": "12306反爬虫拦截（302跳转），请稍后重试或更换网络环境"}
-                                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                            else:
-                                break
-                        
-                        try:
-                            data = resp.json().get("data", {})
-                            transfer_list = data.get("middleList", [])
-                        except Exception:
-                            if page_num == 1:
-                                response_data = {"success": False, "error": "12306反爬拦截或数据异常，请稍后重试"}
-                                return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                            else:
-                                break
-                        
-                        if not transfer_list:
-                            break
-                        
-                        all_transfer_list.extend(transfer_list)
-                        
-                        # 如果返回的数据少于页面大小，说明已经是最后一页
-                        if len(transfer_list) < page_size:
-                            break
-                        
-                        result_index += page_size
-                        page_num += 1
-                    
-                    # Success
-                    break
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                # 清空可能已获取的部分数据，准备重试
-                all_transfer_list = []
-                if attempt < max_retries - 1:
-                    logger.warning(f"中转查询网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"中转查询网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        # 使用中转查询专用接口 - 使用 RailwayHTTPClient 分页查询
+        client = RailwayHTTPClient.get_instance()
+        all_transfer_list = await make_paginated_12306_request(
+            client,
+            "query_transfer",
+            base_params={
+                "train_date": train_date,
+                "from_station_telecode": from_code,
+                "to_station_telecode": to_code,
+                "middle_station": middle_station_code,
+                "can_query": "Y",
+                "isShowWZ": isShowWZ,
+                "purpose_codes": purpose_codes,
+                "channel": "E"
+            },
+            station_info={
+                "from_station": from_station,
+                "to_station": to_station,
+                "train_date": train_date,
+            },
+        )
         
         if not all_transfer_list:
             response_data = {
@@ -1309,11 +1189,14 @@ async def query_transfer_validated(args: dict) -> list:
         }
         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
         
+    except ValueError as e:
+        logger.error(f"查询中转业务错误: {e}")
+        response_data = {"success": False, "error": str(e)}
+        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     except Exception as e:
         logger.error(f"查询中转失败: {repr(e)}")
         response_data = {"success": False, "error": "查询中转失败", "detail": str(e)}
         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-
 
 # ========== query_ticket_price_validated 函数实现 ==========
 async def query_ticket_price_validated(args: dict) -> list:
@@ -1338,13 +1221,7 @@ async def query_ticket_price_validated(args: dict) -> list:
             response_data = {"success": False, "error": error_msg}
             return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
 
-        # 转换三字码
-        async def ensure_telecode(val):
-            if val.isalpha() and val.isupper() and len(val) == 3:
-                return val
-            code = await station_service.get_station_code(val)
-            return code
-
+        # 转换三字码 - 使用全局 ensure_telecode
         from_code = await ensure_telecode(from_station)
         to_code = await ensure_telecode(to_station)
         
@@ -1355,51 +1232,25 @@ async def query_ticket_price_validated(args: dict) -> list:
              response_data = {"success": False, "error": f"到达站无效: {to_station}"}
              return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
 
-        import httpx
-        url_init = HTTP_URLS["init"]
-        url_price = HTTP_URLS["query_price"]
-        headers = HTTP_HEADERS.copy()
-        
-        params = {
-            "leftTicketDTO.train_date": train_date,
-            "leftTicketDTO.from_station": from_code,
-            "leftTicketDTO.to_station": to_code,
-            "purpose_codes": purpose_codes
-        }
+        client = RailwayHTTPClient.get_instance()
+        json_data = await make_12306_request(
+            client,
+            "query_price",
+            params={
+                "leftTicketDTO.train_date": train_date,
+                "leftTicketDTO.from_station": from_code,
+                "leftTicketDTO.to_station": to_code,
+                "purpose_codes": purpose_codes
+            },
+            station_info={
+                "from_station": from_station,
+                "to_station": to_station,
+                "train_date": train_date,
+            },
+        )
 
-        max_retries = 3
-        last_exception = None
-        json_data = None
-
-        for attempt in range(max_retries):
-            try:
-                async with httpx.AsyncClient(follow_redirects=False, timeout=8, verify=False) as client:
-                    await client.get(url_init, headers=headers)
-                    resp = await client.get(url_price, headers=headers, params=params)
-                    logger.info(f"12306 price query status: {resp.status_code}, url: {resp.url}")
-                    
-                    if resp.status_code != 200:
-                         logger.error(f"12306接口返回异常: {resp.status_code}")
-                         response_data = {"success": False, "error": f"12306接口返回异常: {resp.status_code}"}
-                         return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-                    
-                    try:
-                        json_data = resp.json()
-                        break
-                    except Exception as e:
-                        logger.error(f"12306响应解析失败: {str(e)}")
-                        response_data = {"success": False, "error": "12306响应解析失败", "detail": str(e)}
-                        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as e:
-                last_exception = e
-                if attempt < max_retries - 1:
-                    logger.warning(f"票价查询网络请求失败，正在重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                    await asyncio.sleep(1)
-                else:
-                    logger.error(f"票价查询网络请求重试次数已耗尽: {str(e)}")
-        else:
-            response_data = {"success": False, "error": f"网络请求失败 (已重试{max_retries}次): {str(last_exception)}"}
-            return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
+        # 解析票价信息
+        if json_data and "data" in json_data:
 
         # 解析票价信息
         if json_data and "data" in json_data:
@@ -1470,7 +1321,11 @@ async def query_ticket_price_validated(args: dict) -> list:
             return [{"type": "text", "text": json.dumps(final_response, ensure_ascii=False)}]
 
         return [{"type": "text", "text": json.dumps(json_data, ensure_ascii=False)}]
-        
+
+    except ValueError as e:
+        logger.error(f"查询票价业务错误: {e}")
+        response_data = {"success": False, "error": str(e)}
+        return [{"type": "text", "text": json.dumps(response_data, ensure_ascii=False)}]
     except Exception as e:
         logger.error(f"查询票价失败: {repr(e)}")
         response_data = {"success": False, "error": "查询票价失败", "detail": str(e)}
