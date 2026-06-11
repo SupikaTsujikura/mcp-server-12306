@@ -115,7 +115,11 @@ async def make_paginated_12306_request(
                     max_retries=1,
                 )
 
-                items = json_data.get("data", {}).get("middleList", [])
+                data = json_data.get("data", {})
+                if not isinstance(data, dict):
+                    logger.warning("12306返回的data字段非预期格式: %s", type(data))
+                    return all_data if all_data else []
+                items = data.get("middleList", [])
                 if not items:
                     return all_data
 
