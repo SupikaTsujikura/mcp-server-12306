@@ -3,7 +3,6 @@
 """
 
 import asyncio
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -102,6 +101,7 @@ async def make_paginated_12306_request(
         try:
             result_index = 0
             page_num = 1
+            page_failed = False
 
             while page_num <= max_pages:
                 params = dict(base_params)
@@ -112,18 +112,24 @@ async def make_paginated_12306_request(
                     url_key,
                     params=params,
                     station_info=station_info,
-                    # 内部单次请求重试由外层循环覆盖
                     max_retries=1,
                 )
 
                 data = json_data.get("data", {})
+                # 当 data 不是 dict（如空字符串）时，可能是后缀已过时，尝试重新发现
                 if not isinstance(data, dict):
-                    logger.warning("12306返回的data字段非预期格式: %s, 内容: %s", type(data), str(data)[:200])
+                    logger.warning(
+                        "12306返回的data字段非预期格式: %s, 尝试重新发现API后缀...",
+                        type(data),
+                    )
+                    if attempt < max_retries - 1:
+                        await client.close()
+                        await client.init_session()
+                        page_failed = True
+                        break
                     return all_data if all_data else []
-                logger.info("12306中转查询完整响应: %s", json.dumps(json_data, ensure_ascii=False)[:500])
                 items = data.get("middleList", [])
                 if not items:
-                    logger.info("12306中转查询返回空数据, data keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
                     return all_data
 
                 all_data.extend(items)
@@ -134,6 +140,8 @@ async def make_paginated_12306_request(
                 result_index += page_size
                 page_num += 1
 
+            if page_failed:
+                continue  # 进入下一轮 for 循环，重新开始分页
             return all_data
 
         except ValueError as e:

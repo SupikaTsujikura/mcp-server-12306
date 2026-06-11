@@ -36,10 +36,15 @@ _BASE_URLS = {
 _DEFAULT_QUERY_SUFFIX = "queryG"
 
 # 用于从 init 页面 JS 中提取最新 API 后缀的正则模式
-_SUFFIX_PATTERNS = [
-    re.compile(r"/otn/leftTicket/(query[A-Z])\b"),
-    re.compile(r"""var\s+(?:api_)?(?:path|suffix|query)\s*[:=]\s*['"](query[A-Z])['"]"""),
-]
+_SUFFIX_PATTERNS = {
+    "left_ticket": [
+        re.compile(r"/otn/leftTicket/(query[A-Z])\b"),
+        re.compile(r"""var\s+(?:api_)?(?:path|suffix|query)\s*[:=]\s*['"](query[A-Z])['"]"""),
+    ],
+    "lcquery": [
+        re.compile(r"/lcquery/(query[A-Z])\b"),
+    ],
+}
 
 # 向 12306 发请求时需携带的查询上下文 Cookie 键
 _JC_SAVE_KEYS = [
@@ -58,7 +63,10 @@ class RailwayHTTPClient:
 
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
-        self._query_suffix: str = _DEFAULT_QUERY_SUFFIX
+        self._query_suffixes: Dict[str, str] = {
+            "left_ticket": _DEFAULT_QUERY_SUFFIX,
+            "lcquery": _DEFAULT_QUERY_SUFFIX,
+        }
         self._init_done: bool = False
 
     @classmethod
@@ -109,17 +117,19 @@ class RailwayHTTPClient:
 
     def _discover_suffix(self, html_text: str) -> None:
         """从 init 页面的 HTML/JS 中提取当前 API 路径后缀。"""
-        for pattern in _SUFFIX_PATTERNS:
-            match = pattern.search(html_text)
-            if match:
-                new_suffix = match.group(1)
-                if new_suffix and new_suffix != self._query_suffix:
-                    logger.info(
-                        "发现新的 API 路径后缀: %s (之前: %s)",
-                        new_suffix, self._query_suffix,
-                    )
-                    self._query_suffix = new_suffix
-                return
+        for suffix_key, patterns in _SUFFIX_PATTERNS.items():
+            current = self._query_suffixes.get(suffix_key, _DEFAULT_QUERY_SUFFIX)
+            for pattern in patterns:
+                match = pattern.search(html_text)
+                if match:
+                    new_suffix = match.group(1)
+                    if new_suffix and new_suffix != current:
+                        logger.info(
+                            "发现新的 [%s] 路径后缀: %s (之前: %s)",
+                            suffix_key, new_suffix, current,
+                        )
+                        self._query_suffixes[suffix_key] = new_suffix
+                    break
 
     async def init_session(self) -> httpx.Response:
         """访问 init 页面以建立 Cookie 并发现路径后缀。"""
@@ -133,11 +143,11 @@ class RailwayHTTPClient:
     def get_url(self, key: str) -> str:
         """获取指定 API 的完整 URL（自动附加动态后缀）。"""
         if key == "query_left_ticket":
-            return _BASE_URLS["query_left_ticket"] + self._query_suffix
-        # query_transfer 使用固定后缀，不跟随 leftTicket 的动态后缀
-        # 因为 lcquery 与 leftTicket 可能不同步轮换
+            suffix = self._query_suffixes.get("left_ticket", _DEFAULT_QUERY_SUFFIX)
+            return _BASE_URLS["query_left_ticket"] + suffix
         if key == "query_transfer":
-            return _BASE_URLS["query_transfer"] + _DEFAULT_QUERY_SUFFIX
+            suffix = self._query_suffixes.get("lcquery", _DEFAULT_QUERY_SUFFIX)
+            return _BASE_URLS["query_transfer"] + suffix
         return _BASE_URLS[key]
 
     async def request(
@@ -176,7 +186,7 @@ class RailwayHTTPClient:
             )
 
         url = self.get_url(url_key)
-        logger.debug("请求 12306: %s?%s (suffix=%s)", url, params, self._query_suffix)
+        logger.debug("请求 12306: %s?%s", url, params)
 
         resp = await client.request(
             method, url, params=params, headers=request_headers, **kwargs
@@ -211,7 +221,10 @@ class RailwayHTTPClient:
             if self._client and not self._client.is_closed:
                 await self._client.aclose()
             self._init_done = False
-            self._query_suffix = _DEFAULT_QUERY_SUFFIX
+            self._query_suffixes = {
+                "left_ticket": _DEFAULT_QUERY_SUFFIX,
+                "lcquery": _DEFAULT_QUERY_SUFFIX,
+            }
 
 
 # 便捷函数：获取全局单例
